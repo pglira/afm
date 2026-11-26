@@ -1,5 +1,6 @@
 //! The worker process of a job: runs rsync, parses its progress and writes `job.json`.
 
+use crate::fastmove::{self, Moved};
 use crate::job::{log_path, take_control, Job, Op, Status};
 use crate::util::{fmt_duration, has_filters, human_bytes, is_remote, now, proc_stat, parse_hms, parse_speed, rsync_exit_meaning, shell_join, shell_quote};
 use anyhow::Result;
@@ -113,12 +114,39 @@ pub fn run(id: &str) -> Result<()> {
     // Log and state writes in the loop ignore errors: a full disk must not stop the
     // supervision of a running rsync.
     let mut log = BufWriter::new(OpenOptions::new().create(true).append(true).open(log_path(id))?);
-    let _ = writeln!(log, "$ {}", shell_join(&job.command));
+
+    // Sources on the file system of their destination are renamed; rsync moves the rest.
+    let mut command = job.command.clone();
+    let mut renamed = Moved::default();
+    if fastmove::allowed(&job) {
+        let (rest, moved, lines) = fastmove::rename_sources(&job.sources, &job.target);
+        for l in &lines {
+            let _ = writeln!(log, "{l}");
+        }
+        renamed = moved;
+        job.bytes = renamed.bytes;
+        job.files_transferred = renamed.files;
+        if rest.is_empty() {
+            job.status = Status::Done;
+            job.percent = 100;
+            job.eta = Some(0);
+            job.files_total = Some(renamed.entries);
+            job.files_done = renamed.entries;
+            return finish(&mut job, &mut log, "all sources renamed");
+        }
+        // The rsync argv ends with the sources and the target.
+        command.truncate(command.len().saturating_sub(job.sources.len() + 1));
+        command.extend(rest);
+        command.push(job.target.clone());
+    }
+    let _ = writeln!(log, "$ {}", shell_join(&command));
     let _ = log.flush();
 
-    let mut cmd = Command::new(&job.command[0]);
-    cmd.args(&job.command[1..])
-        .current_dir(&job.cwd)
+    // A rename can move the working directory of the job; the paths of the job are absolute.
+    let cwd = if Path::new(&job.cwd).is_dir() { job.cwd.as_str() } else { "/" };
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..])
+        .current_dir(cwd)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -139,11 +167,7 @@ pub fn run(id: &str) -> Result<()> {
         Err(e) => {
             job.status = Status::Failed;
             job.error = Some(format!("cannot start rsync: {e}"));
-            job.finished = Some(now());
-            let _ = writeln!(log, "afm: cannot start rsync: {e}");
-            let _ = log.flush();
-            job.save()?;
-            return Ok(());
+            return finish(&mut job, &mut log, "rsync did not start");
         }
     };
     let pgid = child.id() as i32;
@@ -172,8 +196,8 @@ pub fn run(id: &str) -> Result<()> {
             Ok(Msg::Out(s)) => {
                 dirty = true;
                 if let Some(p) = parse_progress(&s) {
-                    job.bytes = p.bytes;
-                    job.percent = p.percent;
+                    job.bytes = renamed.bytes + p.bytes;
+                    job.percent = total_percent(renamed.bytes, p.bytes, p.percent);
                     if job.status == Status::Running {
                         job.speed = p.speed;
                         if p.percent >= 100 {
@@ -183,11 +207,11 @@ pub fn run(id: &str) -> Result<()> {
                         }
                     }
                     if let Some(n) = p.transferred {
-                        job.files_transferred = n;
+                        job.files_transferred = renamed.files + n;
                     }
                     if let Some((remaining, total)) = p.check {
-                        job.files_total = Some(total);
-                        job.files_done = total.saturating_sub(remaining);
+                        job.files_total = Some(renamed.entries + total);
+                        job.files_done = renamed.entries + total.saturating_sub(remaining);
                     }
                 } else {
                     let _ = writeln!(log, "{s}");
@@ -320,19 +344,31 @@ pub fn run(id: &str) -> Result<()> {
             }
         }
     }
+    let detail = job.exit_code.map(|c| format!("rsync exit code {c}")).unwrap_or_else(|| "no exit code".into());
+    finish(&mut job, &mut log, &detail)
+}
+
+/// Percent of the full job: rsync reports `bytes` and `percent` only for its own part,
+/// after `renamed` bytes were moved by a rename.
+fn total_percent(renamed: u64, bytes: u64, percent: u8) -> u8 {
+    if renamed == 0 || percent == 0 {
+        return percent;
+    }
+    let rsync_total = bytes as u128 * 100 / percent as u128;
+    let done = renamed as u128 + bytes as u128;
+    (done * 100 / (renamed as u128 + rsync_total).max(1)).min(100) as u8
+}
+
+/// Write the end state of the job to the log and to `job.json`, and send the notification.
+fn finish(job: &mut Job, log: &mut impl Write, detail: &str) -> Result<()> {
     job.finished = Some(now());
-    let _ = writeln!(
-        log,
-        "afm: job {} ({})",
-        job.status.as_str(),
-        job.exit_code.map(|c| format!("rsync exit code {c}")).unwrap_or_else(|| "no exit code".into())
-    );
+    let _ = writeln!(log, "afm: job {} ({detail})", job.status.as_str());
     if let Some(e) = &job.error {
         let _ = writeln!(log, "afm: {e}");
     }
     let _ = log.flush();
     job.save()?;
-    notify(&job);
+    notify(job);
     Ok(())
 }
 
@@ -461,6 +497,14 @@ mod tests {
         assert!(p.end_of_file);
         assert_eq!(p.check, Some((0, 6)));
         assert_eq!(p.transferred, Some(4));
+    }
+
+    #[test]
+    fn total_percent_includes_the_renamed_bytes() {
+        assert_eq!(total_percent(0, 50, 50), 50);
+        assert_eq!(total_percent(100, 0, 0), 0);
+        assert_eq!(total_percent(100, 50, 50), 75);
+        assert_eq!(total_percent(300, 100, 100), 100);
     }
 
     #[test]

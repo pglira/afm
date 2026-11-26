@@ -48,7 +48,11 @@ afm status [ID] [--json] | wait ID [--timeout SEC] | log ID | cancel ID | pause 
 - Jobs are in `$AFM_STATE_DIR`, else `$XDG_STATE_HOME/afm`, else `~/.local/state/afm`.
   Each job directory holds `job.json`, `rsync.log` and a `control` file for pause, resume and cancel.
 - Pause and cancel send `SIGSTOP`/`SIGCONT`/`SIGTERM` to the rsync process group, which includes `ssh`.
-- `mv` uses `--remove-source-files`, then removes the empty source directories (also on a remote host over SSH).
+- `mv` renames a local source that is on the file system of its destination, when the destination does not
+  exist and the job has no extra rsync options. Such a move needs no copy of the data, and it keeps the owner,
+  the hard links and all attributes of the files.
+- For all other sources, `mv` uses `--remove-source-files`, then removes the empty source directories (also on a
+  remote host over SSH).
 - SSH runs with `BatchMode=yes` unless `RSYNC_RSH` is set, so a password prompt cannot block a job.
 - `-x, --exact` adds `-HAX` (hard links, ACLs, extended attributes).
 - At the end of a job, the worker sends a desktop notification (`notify-send`): always for a failed

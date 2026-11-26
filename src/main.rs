@@ -1,4 +1,5 @@
 mod dash;
+mod fastmove;
 mod job;
 mod safety;
 mod util;

@@ -36,7 +36,10 @@ afm cancel JOB_ID                  # stop a job
   contents" (the same as `dir/` and `./`).
 - Remote paths use SSH: `host:/path` or `user@host:/path`. SSH must work without a
   password prompt (key-based login). One side must be local.
-- `afm mv` deletes each source file only after its transfer is complete. At the end,
+- `afm mv` renames a local source that is on the file system of its destination, when
+  the destination does not exist and there are no extra rsync options. This is instant
+  for any size. For all other sources, rsync moves the data.
+- With rsync, `afm mv` deletes each source file only after its transfer is complete. At the end,
   it removes the empty source directories. It keeps them when the rsync options contain
   filters (`--exclude`, `--include`, `--filter`, `--files-from`, ...) or a dry run.
 - `afm` refuses a transfer when the source and the destination are the same path, when
