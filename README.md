@@ -55,3 +55,7 @@ afm status [ID] [--json] | wait ID [--timeout SEC] | log ID | cancel ID | pause 
   job, and for a done job that ran at least `$AFM_NOTIFY_MIN_SECS` seconds (default 10).
   `AFM_NOTIFY=0` turns notifications off. The worker uses the environment of the process that started the job.
 - The agent name is `--agent`, else `$AFM_AGENT`, else the first parent process that is not a shell.
+
+## License
+
+MIT
