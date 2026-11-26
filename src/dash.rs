@@ -12,7 +12,7 @@ use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Sparkline, Table, TableState,
+    Block, BorderType, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, TableState,
 };
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{HashMap, VecDeque};
@@ -23,7 +23,12 @@ use std::time::{Duration, Instant};
 
 const RELOAD: Duration = Duration::from_millis(500);
 const BAR_WIDTH: usize = 14;
-const SPEED_SAMPLES: usize = 240;
+/// Speed samples that are kept per job; one sample fills one column of the speed graph.
+const SPEED_SAMPLES: usize = 600;
+/// Width of the y axis of the speed graph: label, space and axis line.
+const AXIS_WIDTH: u16 = 9;
+/// Smallest height of the speed graph: statistics line, three plot rows and time axis.
+const GRAPH_MIN_HEIGHT: u16 = 5;
 
 /// Dracula palette (https://draculatheme.com/contribute).
 mod theme {
@@ -198,6 +203,129 @@ fn key_hint(k: &str, desc: &str) -> Vec<Span<'static>> {
         Span::styled(format!(" {k} "), Style::new().fg(BG).bg(PURPLE).bold()),
         Span::styled(format!(" {desc}  "), Style::new().fg(COMMENT)),
     ]
+}
+
+/// Colors of the speed graph, from the bottom row to the top row.
+fn graph_gradient(s: Status) -> (Color, Color) {
+    match s {
+        Status::Starting | Status::Running => (PURPLE, CYAN),
+        _ => (blend(status_color(s), BG, 0.6), status_color(s)),
+    }
+}
+
+/// Mix two RGB colors; `t` = 0 gives `a`, `t` = 1 gives `b`.
+fn blend(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+            Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+        }
+        _ => a,
+    }
+}
+
+/// Smallest value of the series 1, 2, 5, 10, 20, 50, … (per binary unit) that is not below `v`.
+fn nice_ceil(v: u64) -> u64 {
+    let mut unit = 1u64;
+    while v / unit >= 1024 && unit < 1 << 50 {
+        unit *= 1024;
+    }
+    [1, 2, 5, 10, 20, 50, 100, 200, 500, 1024]
+        .iter()
+        .map(|m| m * unit)
+        .find(|&n| n >= v)
+        .unwrap_or(v)
+}
+
+/// Area chart of the speed samples: statistics line, y axis with grid lines, filled columns
+/// with a vertical color gradient, and a time axis. The newest sample is at the right edge.
+fn draw_speed_graph(f: &mut Frame, area: Rect, samples: &[u64], status: Status) {
+    if area.height < GRAPH_MIN_HEIGHT || area.width < AXIS_WIDTH + 20 {
+        return;
+    }
+    let [stats, body, time] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    // An even number of plot rows puts the middle grid line at half of the axis maximum.
+    let spare = if body.height >= 5 { body.height % 2 } else { 0 };
+    let plot = Rect {
+        x: body.x + AXIS_WIDTH,
+        y: body.y + spare,
+        width: body.width - AXIS_WIDTH,
+        height: body.height - spare,
+    };
+    let samples = &samples[samples.len().saturating_sub(plot.width as usize)..];
+
+    let comment = Style::new().fg(COMMENT);
+    let peak = samples.iter().copied().max().unwrap_or(0);
+    let avg = if samples.is_empty() { 0 } else { (samples.iter().map(|&v| v as u128).sum::<u128>() / samples.len() as u128) as u64 };
+    let stat = |label: &str, v: u64, color: Color| {
+        vec![
+            Span::styled(format!("{label} "), comment),
+            Span::styled(format!("{}/s", short_bytes(v)), Style::new().fg(color).bold()),
+            Span::raw("    "),
+        ]
+    };
+    let (low, high) = graph_gradient(status);
+    let mut spans = vec![Span::styled(format!("{:<8}", "speed"), comment)];
+    // A finished job has no current speed; its newest sample is the speed at its end.
+    let (newest, right) = if status.is_final() { ("last", " end ") } else { ("now", " now ") };
+    spans.extend(stat(newest, samples.last().copied().unwrap_or(0), high));
+    spans.extend(stat("avg", avg, FG));
+    spans.extend(stat("peak", peak, FG));
+    f.render_widget(Paragraph::new(Line::from(spans)), stats);
+
+    // Time axis: the plot width is the time window, one column per sample.
+    let window = fmt_duration((plot.width as u128 * RELOAD.as_millis() / 1000) as u64);
+    let left = format!(" {window} ago ");
+    let fill = (plot.width as usize).saturating_sub(left.len() + right.len() + 1);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("╰─", Style::new().fg(LINE)),
+            Span::styled(left, comment),
+            Span::styled("─".repeat(fill), Style::new().fg(LINE)),
+            Span::styled(right, comment),
+        ])),
+        Rect { x: plot.x - 1, width: plot.width + 1, ..time },
+    );
+
+    const LEVELS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let rows = plot.height as usize;
+    let max = nice_ceil(peak.max(1));
+    // Grid lines are at the top edge of the top row and, with samples, of the row below the middle.
+    let grid_rows = [Some(rows - 1), (rows >= 4 && !samples.is_empty()).then(|| rows / 2 - 1)];
+    let offset = plot.width as usize - samples.len();
+    let buf = f.buffer_mut();
+    for r in 0..rows {
+        let y = plot.y + (rows - 1 - r) as u16;
+        let is_grid = grid_rows.contains(&Some(r));
+        let label = if is_grid && peak > 0 {
+            format!("{}/s", short_bytes((max as u128 * (r as u128 + 1) / rows as u128) as u64))
+        } else {
+            String::new()
+        };
+        buf.set_string(body.x, y, format!("{label:>w$}", w = AXIS_WIDTH as usize - 2), comment);
+        buf.set_string(plot.x - 1, y, if is_grid { "┤" } else { "│" }, Style::new().fg(LINE));
+        let t = if rows > 1 { r as f64 / (rows - 1) as f64 } else { 1.0 };
+        let color = blend(low, high, t);
+        for col in 0..plot.width as usize {
+            // Height of the column in eighths of a row; a sample above zero shows at least one eighth.
+            let level = col.checked_sub(offset).map_or(0, |i| {
+                let v = samples[i];
+                ((v as u128 * rows as u128 * 8 + max as u128 / 2) / max as u128).max((v > 0) as u128) as usize
+            });
+            let fill = level.saturating_sub(r * 8).min(8);
+            let x = plot.x + col as u16;
+            if fill > 0 {
+                buf.set_string(x, y, LEVELS[fill], Style::new().fg(color));
+            } else if is_grid {
+                buf.set_string(x, y, "▔", Style::new().fg(LINE));
+            }
+        }
+    }
+    if samples.is_empty() {
+        let msg = Rect { y: plot.y + plot.height / 2, height: 1, ..plot };
+        f.render_widget(Paragraph::new(Span::styled(" no samples ", comment)).alignment(Alignment::Center), msg);
+    }
 }
 
 impl App {
@@ -419,7 +547,7 @@ impl App {
         let [header, table, details, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(6),
-            Constraint::Length(8),
+            Constraint::Length(if area.height >= 30 { 14 } else { 10 }),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -559,47 +687,34 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let [paths, graph] = Layout::horizontal([Constraint::Min(30), Constraint::Length(40)])
-            .spacing(3)
-            .areas(inner);
-
+        // The paths use the rows that the smallest graph does not need.
+        let max_paths = inner.height.saturating_sub(GRAPH_MIN_HEIGHT).max(2) as usize;
         let key = |k: &str| Span::styled(format!("{k:<8}"), Style::new().fg(COMMENT));
-        let room = (paths.width as usize).saturating_sub(8);
+        let room = (inner.width as usize).saturating_sub(8);
         let path = |p: &str| Span::styled(tail_fit(&tilde(p), room), Style::new().fg(FG));
-        let mut lines: Vec<Line> = j.sources.iter().map(|s| Line::from(vec![key("source"), path(s)])).collect();
-        lines.push(Line::from(vec![key("target"), path(&j.target)]));
-        f.render_widget(Paragraph::new(lines), paths);
-
-        let samples: Vec<u64> = self
-            .speeds
-            .get(&j.id)
-            .map(|s| {
-                let skip = s.len().saturating_sub(graph.width as usize);
-                s.iter().skip(skip).copied().collect()
-            })
-            .unwrap_or_default();
-        let peak = samples.iter().copied().max().unwrap_or(0);
-        let graph_title = Line::from(vec![
-            Span::styled("speed", Style::new().fg(COMMENT)),
-            Span::styled(format!("   peak {}/s", short_bytes(peak)), Style::new().fg(COMMENT).italic()),
-        ]);
-        let graph_block = Block::new().title(graph_title);
-        let graph_inner = graph_block.inner(graph);
-        f.render_widget(graph_block, graph);
-        if samples.is_empty() {
-            f.render_widget(
-                Paragraph::new(Span::styled("no samples", Style::new().fg(LINE))).alignment(Alignment::Center),
-                graph_inner,
-            );
-        } else {
-            f.render_widget(
-                Sparkline::default()
-                    .data(&samples)
-                    .max(peak.max(1) * 5 / 4)
-                    .style(Style::new().fg(status_color(j.status)).bg(BG_DARK)),
-                graph_inner,
-            );
+        // One line is for the target; a summary line replaces the sources that do not fit.
+        let shown = if j.sources.len() < max_paths { j.sources.len() } else { max_paths - 2 };
+        let mut lines: Vec<Line> =
+            j.sources.iter().take(shown).map(|s| Line::from(vec![key("source"), path(s)])).collect();
+        if shown < j.sources.len() {
+            let rest = j.sources.len() - shown;
+            let (label, text) =
+                if shown == 0 { ("source", format!("{rest} sources")) } else { ("", format!("{rest} more sources")) };
+            lines.push(Line::from(vec![key(label), Span::styled(text, Style::new().fg(COMMENT).italic())]));
         }
+        lines.push(Line::from(vec![key("target"), path(&j.target)]));
+
+        // An empty row separates the paths from the graph when the panel has room for it.
+        let spacer = (inner.height > lines.len() as u16 + GRAPH_MIN_HEIGHT) as u16;
+        let [paths, _, graph] = Layout::vertical([
+            Constraint::Length(lines.len() as u16),
+            Constraint::Length(spacer),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+        f.render_widget(Paragraph::new(lines), paths);
+        let samples: Vec<u64> = self.speeds.get(&j.id).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        draw_speed_graph(f, graph, &samples, j.status);
     }
 
     fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
@@ -705,6 +820,17 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nice_ceil_rounds_up_to_the_series() {
+        use super::nice_ceil;
+        assert_eq!(nice_ceil(1), 1);
+        assert_eq!(nice_ceil(3), 5);
+        assert_eq!(nice_ceil(600), 1024);
+        assert_eq!(nice_ceil(1024), 1024);
+        assert_eq!(nice_ceil(12 << 20), 20 << 20);
+        assert_eq!(nice_ceil(900 << 20), 1 << 30);
+    }
+
     #[test]
     fn base64_matches_reference() {
         assert_eq!(super::base64(b""), "");
